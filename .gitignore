@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.exe
+*.o
+*.obj
+*.bin
+loader.exe
+encode2aes-linux
+encode2aes.exe
+build_id.h
+aes.encrypted
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+.DS_Store
+*.log
+*.tmp
+*~
+.vscode/
+.idea/
