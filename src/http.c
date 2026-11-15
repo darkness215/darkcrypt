@@ -15,6 +15,9 @@
  *   - 16 MB download cap and chunked read are preserved.
  *   - Debug output is still guarded by #if DEBUG (see obfuscation.h).
  *
+ * The WinHttp* DJB2 hashes below use the exact algorithm in peb.c
+ * (h=5381; h=((h<<5)+h)+c). kernel32 hashes (GetTickCount /
+ * MultiByteToWideChar / LoadLibraryA) match peb.h exactly.
  */
 
 #include "http.h"
